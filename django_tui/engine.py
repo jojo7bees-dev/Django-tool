@@ -52,6 +52,14 @@ class DjangoProject:
     def is_valid(self) -> bool:
         return self.manage_py is not None and self.manage_py.exists()
 
+    def discover_profiles(self) -> List[str]:
+        if not self.manage_py: return []
+        project_dir = self.manage_py.parent
+        settings_dir = project_dir / self.project_name / "settings"
+        if settings_dir.exists() and settings_dir.is_dir():
+            return [f.stem for f in settings_dir.glob("*.py") if f.name != "__init__.py"]
+        return []
+
     def get_settings_path(self) -> Optional[Path]:
         if not self.settings_module or not self.manage_py:
             return None
@@ -297,13 +305,61 @@ class ProjectAnalyzer:
                         "models": []
                     }
                     for model in app_config.get_models():
-                        app_info["models"].append(model.__name__)
+                        model_info = {
+                            "name": model.__name__,
+                            "relations": []
+                        }
+                        for field in model._meta.get_fields():
+                            if field.is_relation:
+                                related_model = field.related_model.__name__ if field.related_model else "Self"
+                                model_info["relations"].append(f"{field.name} -> {related_model}")
+
+                        app_info["models"].append(model_info)
                         structure["models_count"] += 1
                     structure["apps"].append(app_info)
         except Exception as e:
             structure["error"] = str(e)
 
         return structure
+
+    def check_circular_dependencies(self) -> List[str]:
+        # Very basic check using model relations
+        circular = []
+        try:
+            from django.apps import apps
+            deps = {}
+            for app_config in apps.get_app_configs():
+                if app_config.name.startswith('django.'): continue
+                deps[app_config.label] = set()
+                for model in app_config.get_models():
+                    for field in model._meta.get_fields():
+                        if field.is_relation and field.related_model:
+                            related_app = field.related_model._meta.app_label
+                            if related_app != app_config.label:
+                                deps[app_config.label].add(related_app)
+
+            # Simple cycle detection (DFS)
+            visited = set()
+            path = []
+
+            def has_cycle(u):
+                visited.add(u)
+                path.append(u)
+                for v in deps.get(u, []):
+                    if v in path:
+                        circular.append(f"Cycle detected: {' -> '.join(path[path.index(v):])} -> {v}")
+                        return True
+                    if v not in visited:
+                        if has_cycle(v): return True
+                path.pop()
+                return False
+
+            for app in deps:
+                if app not in visited:
+                    has_cycle(app)
+        except Exception:
+            pass
+        return circular
 
 class SecurityScanner:
     def __init__(self, project: DjangoProject):

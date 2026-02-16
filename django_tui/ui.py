@@ -57,6 +57,9 @@ class SettingsEditorScreen(Screen):
         yield Header()
         with Container(id="settings-container"):
             yield Label("Settings Editor")
+            profiles = self.project.discover_profiles()
+            if profiles:
+                yield Label(f"Detected Profiles: {', '.join(profiles)}")
             yield Horizontal(
                 Label("DEBUG:", id="label-debug"),
                 Button("Toggle", id="toggle-debug"),
@@ -202,7 +205,8 @@ class ORMExplorerScreen(Screen):
                 items = []
                 for app in structure.get('apps', []):
                     for model in app['models']:
-                        items.append(ListItem(Label(f"{app['label']}.{model}"), id=f"model-{model}"))
+                        model_name = model['name']
+                        items.append(ListItem(Label(f"{app['label']}.{model_name}"), id=f"model-{model_name}"))
                 yield ListView(*items, id="orm-model-list")
 
             with Vertical(id="orm-main"):
@@ -303,8 +307,52 @@ class SchemaScreen(Screen):
                 app_node = tree.root.add(app_config.label, expand=True)
                 for model in app_config.get_models():
                     model_node = app_node.add(model.__name__)
+                    fields_node = model_node.add("Fields")
                     for field in model._meta.get_fields():
-                        model_node.add(f"{field.name} ({field.get_internal_type()})")
+                        if not field.is_relation:
+                            fields_node.add(f"{field.name} ({field.get_internal_type()})")
+
+                    rels_node = model_node.add("Relationships")
+                    for field in model._meta.get_fields():
+                        if field.is_relation:
+                            rel_type = "M2M" if field.many_to_many else ("O2O" if field.one_to_one else "FK")
+                            related = field.related_model.__name__ if field.related_model else "Self"
+                            rels_node.add(f"{field.name} [{rel_type}] -> {related}")
+
+class TestRunnerScreen(Screen):
+    def __init__(self, project: DjangoProject):
+        super().__init__()
+        self.project = project
+        self.runner = CommandRunner(project)
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="test-container"):
+            yield Label("Test Runner (pytest)")
+            with Horizontal(classes="row"):
+                yield Button("Run All Tests", id="btn-run-tests")
+                yield Button("Run with Coverage", id="btn-run-cov")
+            yield Log(id="test-log")
+        yield Footer()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        log = self.query_one("#test-log", Log)
+        if event.button.id == "btn-run-tests":
+            log.write("> pytest\n")
+            # Using sys.executable to ensure we use the same environment
+            import sys
+            cmd = [sys.executable, "-m", "pytest"]
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.project.root_path)
+            )
+            stdout, stderr = await process.communicate()
+            log.write(stdout.decode() + stderr.decode() + "\n")
+        elif event.button.id == "btn-run-cov":
+            log.write("> pytest --cov\n")
+            self.notify("Coverage requires pytest-cov to be installed", severity="info")
 
 class DevOpsScreen(Screen):
     def __init__(self, project: DjangoProject):
@@ -365,6 +413,8 @@ class Dashboard(Screen):
             ),
             Static("## Git Status", classes="subtitle"),
             Static("Loading Git status...", id="git-status-box", classes="git-box"),
+            Static("## Project Health", classes="subtitle"),
+            Static("Checking health...", id="health-box", classes="health-box"),
             Static("## Apps", classes="subtitle"),
             ListView(*[ListItem(Label(app['name'])) for app in structure.get('apps', [])]),
             id="dashboard-content"
@@ -373,10 +423,18 @@ class Dashboard(Screen):
 
     def on_mount(self) -> None:
         self.run_worker(self.update_git_status())
+        self.run_worker(self.update_health_status())
 
     async def update_git_status(self):
         status = await self.runner.get_git_status()
         self.query_one("#git-status-box", Static).update(status or "Git repository clean or no changes.")
+
+    async def update_health_status(self):
+        circles = self.analyzer.check_circular_dependencies()
+        if circles:
+            self.query_one("#health-box", Static).update("\n".join(circles))
+        else:
+            self.query_one("#health-box", Static).update("No circular dependencies detected between apps.")
 
 class DjangoTUI(App):
     CSS = """
@@ -463,8 +521,22 @@ class DjangoTUI(App):
         height: 1fr;
         border: solid $accent;
     }
+    #test-container {
+        padding: 1;
+    }
+    #test-log {
+        height: 1fr;
+        border: solid $accent;
+        margin-top: 1;
+    }
     .git-box {
         border: solid yellow;
+        padding: 1;
+        margin: 1;
+        height: 5;
+    }
+    .health-box {
+        border: solid red;
         padding: 1;
         margin: 1;
         height: 5;
@@ -501,6 +573,7 @@ class DjangoTUI(App):
         ("o", "switch_screen('orm')", "ORM"),
         ("v", "switch_screen('schema')", "Schema"),
         ("x", "switch_screen('devops')", "DevOps"),
+        ("t", "switch_screen('tests')", "Tests"),
     ]
 
     def on_mount(self) -> None:
@@ -512,6 +585,7 @@ class DjangoTUI(App):
         self.install_screen(ORMExplorerScreen(self.project), name="orm")
         self.install_screen(SchemaScreen(self.project), name="schema")
         self.install_screen(DevOpsScreen(self.project), name="devops")
+        self.install_screen(TestRunnerScreen(self.project), name="tests")
         self.push_screen("dashboard")
 
 if __name__ == "__main__":
