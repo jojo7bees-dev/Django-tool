@@ -78,14 +78,38 @@ class SettingsEditorScreen(Screen):
                 Input(placeholder="app_name", id="new-app-name"),
                 Button("Add", id="add-app-btn")
             )
+
+            yield Label("MIDDLEWARE:")
+            self.middleware_table = DataTable(id="middleware-table")
+            yield self.middleware_table
+
+            yield Label("Add Middleware:")
+            yield Horizontal(
+                Input(placeholder="middleware.class.Path", id="new-middleware"),
+                Button("Add", id="add-middleware-btn")
+            )
+
+            yield Label("DATABASES (Default):")
+            db = self.manager.get_setting("DATABASES") or {}
+            default_db = db.get("default", {})
+            yield Static(f"Engine: {default_db.get('ENGINE')}\nName: {default_db.get('NAME')}", classes="db-info")
+
         yield Footer()
 
     def on_mount(self) -> None:
+        # Apps Table
         table = self.query_one("#apps-table", DataTable)
         table.add_columns("App Name")
         apps = self.manager.get_setting("INSTALLED_APPS") or []
         for app in apps:
             table.add_row(app)
+
+        # Middleware Table
+        m_table = self.query_one("#middleware-table", DataTable)
+        m_table.add_columns("Middleware Path")
+        mws = self.manager.get_setting("MIDDLEWARE") or []
+        for mw in mws:
+            m_table.add_row(mw)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "toggle-debug":
@@ -110,6 +134,13 @@ class SettingsEditorScreen(Screen):
                 self.query_one("#apps-table", DataTable).add_row(app_name)
                 self.query_one("#new-app-name", Input).value = ""
                 self.notify(f"Added {app_name}")
+        elif event.button.id == "add-middleware-btn":
+            mw_path = self.query_one("#new-middleware", Input).value
+            if mw_path:
+                self.manager.add_to_list("MIDDLEWARE", mw_path)
+                self.query_one("#middleware-table", DataTable).add_row(mw_path)
+                self.query_one("#new-middleware", Input).value = ""
+                self.notify(f"Added Middleware: {mw_path}")
 
 class MigrationManagerScreen(Screen):
     def __init__(self, project: DjangoProject):
@@ -125,6 +156,12 @@ class MigrationManagerScreen(Screen):
                 yield Button("Show Migrations", id="btn-show-migrations")
                 yield Button("Make Migrations", id="btn-make-migrations")
                 yield Button("Migrate", variant="primary", id="btn-migrate")
+
+            yield Label("SQL Preview (app_label migration_name):")
+            yield Horizontal(
+                Input(placeholder="e.g. auth 0001", id="input-sqlmigrate"),
+                Button("View SQL", id="btn-sqlmigrate")
+            )
             yield Log(id="migration-log")
         yield Footer()
 
@@ -140,6 +177,16 @@ class MigrationManagerScreen(Screen):
         elif event.button.id == "btn-migrate":
             log.write("> python manage.py migrate\n")
             await self.runner.run("migrate", callback=lambda line, err: log.write(line + "\n"))
+        elif event.button.id == "btn-sqlmigrate":
+            val = self.query_one("#input-sqlmigrate", Input).value
+            if val:
+                args = val.split()
+                if len(args) >= 2:
+                    log.write(f"> python manage.py sqlmigrate {args[0]} {args[1]}\n")
+                    res = await self.runner.run("sqlmigrate", *args)
+                    log.write(res.stdout + res.stderr + "\n")
+                else:
+                    self.notify("Format: app_label migration_name", severity="warning")
 
 class DependencyScreen(Screen):
     def __init__(self, project: DjangoProject):
@@ -354,6 +401,56 @@ class TestRunnerScreen(Screen):
             log.write("> pytest --cov\n")
             self.notify("Coverage requires pytest-cov to be installed", severity="info")
 
+class AIAssistantScreen(Screen):
+    def __init__(self, project: DjangoProject):
+        super().__init__()
+        self.project = project
+        self.analyzer = ProjectAnalyzer(project)
+        self.manager = SettingsManager(project)
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="ai-container"):
+            yield Label("Django AI Assistant (Optimizations)")
+            yield Button("Run Analysis", variant="primary", id="btn-ai-run")
+            yield Log(id="ai-log")
+        yield Footer()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-ai-run":
+            log = self.query_one("#ai-log", Log)
+            log.clear()
+            log.write("Analyzing project for optimizations...\n")
+
+            suggestions = []
+
+            # 1. DEBUG check
+            debug = self.manager.get_setting("DEBUG")
+            if debug:
+                suggestions.append("⚠️ [CRITICAL] DEBUG is True. Consider setting to False for production.")
+
+            # 2. Database Indexing
+            structure = self.analyzer.get_project_structure()
+            if structure.get("models_count", 0) > 10:
+                suggestions.append("ℹ️ [PERFORMANCE] You have many models. Ensure database indexes are optimized.")
+
+            # 3. Cache Check
+            caches = self.manager.get_setting("CACHES")
+            if not caches or "LocMemCache" in str(caches):
+                suggestions.append("ℹ️ [SCALING] Using local memory cache. For production, consider Redis or Memcached.")
+
+            # 4. Security Score
+            scanner = SecurityScanner(self.project)
+            report = scanner.scan()
+            if report['score'] < 80:
+                suggestions.append(f"⚠️ [SECURITY] Score is {report['score']}/100. Visit Security Scan for details.")
+
+            if not suggestions:
+                log.write("✅ Project looks well-optimized!\n")
+            else:
+                for s in suggestions:
+                    log.write(s + "\n")
+
 class DevOpsScreen(Screen):
     def __init__(self, project: DjangoProject):
         super().__init__()
@@ -413,7 +510,7 @@ class Dashboard(Screen):
             ),
             Static("## Git Status", classes="subtitle"),
             Static("Loading Git status...", id="git-status-box", classes="git-box"),
-            Static("## Project Health", classes="subtitle"),
+            Static("## Project Health & Security", classes="subtitle"),
             Static("Checking health...", id="health-box", classes="health-box"),
             Static("## Apps", classes="subtitle"),
             ListView(*[ListItem(Label(app['name'])) for app in structure.get('apps', [])]),
@@ -431,10 +528,21 @@ class Dashboard(Screen):
 
     async def update_health_status(self):
         circles = self.analyzer.check_circular_dependencies()
+        scanner = SecurityScanner(self.project)
+        report = scanner.scan()
+
+        status = []
         if circles:
-            self.query_one("#health-box", Static).update("\n".join(circles))
+            status.extend(circles)
         else:
-            self.query_one("#health-box", Static).update("No circular dependencies detected between apps.")
+            status.append("✅ No circular dependencies detected.")
+
+        if report['findings']:
+            status.append(f"⚠️ Found {len(report['findings'])} security concerns.")
+        else:
+            status.append("✅ Security settings look good.")
+
+        self.query_one("#health-box", Static).update("\n".join(status))
 
 class DjangoTUI(App):
     CSS = """
@@ -453,6 +561,14 @@ class DjangoTUI(App):
         border: solid $accent;
         margin-top: 1;
     }
+    #ai-container {
+        padding: 1;
+    }
+    #ai-log {
+        height: 1fr;
+        border: solid $accent;
+        margin-top: 1;
+    }
     #settings-container {
         padding: 2;
     }
@@ -463,6 +579,11 @@ class DjangoTUI(App):
     }
     #settings-container Label {
         width: 20;
+    }
+    .db-info {
+        border: dashed white;
+        padding: 1;
+        margin-top: 1;
     }
     #migration-container {
         padding: 1;
@@ -536,10 +657,10 @@ class DjangoTUI(App):
         height: 5;
     }
     .health-box {
-        border: solid red;
+        border: solid orange;
         padding: 1;
         margin: 1;
-        height: 5;
+        height: 7;
     }
     .box {
         border: solid green;
@@ -574,6 +695,7 @@ class DjangoTUI(App):
         ("v", "switch_screen('schema')", "Schema"),
         ("x", "switch_screen('devops')", "DevOps"),
         ("t", "switch_screen('tests')", "Tests"),
+        ("a", "switch_screen('ai')", "AI"),
     ]
 
     def on_mount(self) -> None:
@@ -586,6 +708,7 @@ class DjangoTUI(App):
         self.install_screen(SchemaScreen(self.project), name="schema")
         self.install_screen(DevOpsScreen(self.project), name="devops")
         self.install_screen(TestRunnerScreen(self.project), name="tests")
+        self.install_screen(AIAssistantScreen(self.project), name="ai")
         self.push_screen("dashboard")
 
 if __name__ == "__main__":
