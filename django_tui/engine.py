@@ -188,6 +188,11 @@ class SettingsManager:
     def update_setting(self, key: str, value: Any):
         if not self.settings_path: return
         content = self.settings_path.read_text()
+
+        # Create backup before modification
+        backup_path = self.settings_path.with_suffix(".py.bak")
+        backup_path.write_text(content)
+
         tree = cst.parse_module(content)
 
         class UpdateTransformer(cst.CSTTransformer):
@@ -215,6 +220,43 @@ class SettingsManager:
 
         self.settings_path.write_text(modified_tree.code)
 
+    def rename_app(self, old_name: str, new_name: str) -> List[str]:
+        logs = []
+        if not self.settings_path: return ["Settings path not found"]
+
+        project_dir = self.project.manage_py.parent
+        old_path = project_dir / old_name
+        new_path = project_dir / new_name
+
+        if not old_path.exists():
+            return [f"App {old_name} not found at {old_path}"]
+
+        try:
+            # 1. Update settings.py
+            current_apps = self.get_setting("INSTALLED_APPS")
+            if current_apps and old_name in current_apps:
+                new_apps = [new_name if app == old_name else app for app in current_apps]
+                self.update_setting("INSTALLED_APPS", new_apps)
+                logs.append(f"Updated INSTALLED_APPS in settings.py")
+
+            # 2. Rename directory
+            old_path.rename(new_path)
+            logs.append(f"Renamed directory {old_name} to {new_name}")
+
+            # 3. Update apps.py if exists
+            apps_py = new_path / "apps.py"
+            if apps_py.exists():
+                content = apps_py.read_text()
+                new_content = content.replace(f"name = '{old_name}'", f"name = '{new_name}'")
+                new_content = new_content.replace(f'name = "{old_name}"', f'name = "{new_name}"')
+                apps_py.write_text(new_content)
+                logs.append("Updated apps.py name")
+
+        except Exception as e:
+            logs.append(f"Error during rename: {e}")
+
+        return logs
+
     def add_to_list(self, key: str, item: str):
         current_list = self.get_setting(key) or []
         if isinstance(current_list, list) and item not in current_list:
@@ -226,6 +268,15 @@ class SettingsManager:
         if isinstance(current_list, list) and item in current_list:
             current_list.remove(item)
             self.update_setting(key, current_list)
+
+    def undo_last_change(self) -> bool:
+        if not self.settings_path: return False
+        backup_path = self.settings_path.with_suffix(".py.bak")
+        if backup_path.exists():
+            content = backup_path.read_text()
+            self.settings_path.write_text(content)
+            return True
+        return False
 
 class DependencyManager:
     def __init__(self, project: DjangoProject):

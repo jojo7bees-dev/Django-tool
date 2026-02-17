@@ -44,3 +44,6 @@ python -m django_tui.main --scan
 - `o`: ORM Explorer
 - `v`: Schema View
 - `x`: DevOps
+- `t`: Tests
+- `a`: AI Assistant
+- `r`: Refactor Tools

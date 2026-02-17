@@ -56,7 +56,9 @@ class SettingsEditorScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="settings-container"):
-            yield Label("Settings Editor")
+            with Horizontal(classes="settings-header"):
+                yield Label("Settings Editor")
+                yield Button("Undo Last Change", id="btn-undo-settings", variant="warning")
             profiles = self.project.discover_profiles()
             if profiles:
                 yield Label(f"Detected Profiles: {', '.join(profiles)}")
@@ -141,6 +143,11 @@ class SettingsEditorScreen(Screen):
                 self.query_one("#middleware-table", DataTable).add_row(mw_path)
                 self.query_one("#new-middleware", Input).value = ""
                 self.notify(f"Added Middleware: {mw_path}")
+        elif event.button.id == "btn-undo-settings":
+            if self.manager.undo_last_change():
+                self.notify("Undo successful! Please refresh screen to see changes.")
+            else:
+                self.notify("No backup found to undo.", severity="error")
 
 class MigrationManagerScreen(Screen):
     def __init__(self, project: DjangoProject):
@@ -156,6 +163,12 @@ class MigrationManagerScreen(Screen):
                 yield Button("Show Migrations", id="btn-show-migrations")
                 yield Button("Make Migrations", id="btn-make-migrations")
                 yield Button("Migrate", variant="primary", id="btn-migrate")
+
+            yield Label("Backup & Restore:")
+            with Horizontal():
+                yield Button("Backup Data (JSON)", id="btn-dumpdata")
+                yield Button("Restore Data (JSON)", id="btn-loaddata")
+                yield Button("SQLite DB Backup", id="btn-sqlite-backup")
 
             yield Label("SQL Preview (app_label migration_name):")
             yield Horizontal(
@@ -187,6 +200,29 @@ class MigrationManagerScreen(Screen):
                     log.write(res.stdout + res.stderr + "\n")
                 else:
                     self.notify("Format: app_label migration_name", severity="warning")
+        elif event.button.id == "btn-dumpdata":
+            log.write("> python manage.py dumpdata --indent 2 > backup.json\n")
+            # We'll run it and capture output to write to file manually for safety
+            res = await self.runner.run("dumpdata", "--indent", "2")
+            if res.returncode == 0:
+                (self.project.root_path / "backup.json").write_text(res.stdout)
+                log.write("Backup saved to backup.json\n")
+            else:
+                log.write(f"Error: {res.stderr}\n")
+        elif event.button.id == "btn-loaddata":
+            if (self.project.root_path / "backup.json").exists():
+                log.write("> python manage.py loaddata backup.json\n")
+                await self.runner.run("loaddata", "backup.json", callback=lambda l, e: log.write(l + "\n"))
+            else:
+                self.notify("backup.json not found", severity="error")
+        elif event.button.id == "btn-sqlite-backup":
+            import shutil
+            db_path = self.project.root_path / "db.sqlite3"
+            if db_path.exists():
+                shutil.copy(db_path, str(db_path) + ".bak")
+                log.write("db.sqlite3 backed up to db.sqlite3.bak\n")
+            else:
+                self.notify("db.sqlite3 not found", severity="error")
 
 class DependencyScreen(Screen):
     def __init__(self, project: DjangoProject):
@@ -242,6 +278,8 @@ class ORMExplorerScreen(Screen):
         self.project = project
         self.runner = CommandRunner(project)
         self.analyzer = ProjectAnalyzer(project)
+        self.offset = 0
+        self.limit = 10
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -261,16 +299,33 @@ class ORMExplorerScreen(Screen):
                 yield Input(placeholder="filter: e.g. id=1", id="orm-filter")
                 yield Horizontal(
                     Input(placeholder="order_by", id="orm-order"),
-                    Input(placeholder="limit", id="orm-limit"),
+                    Input(placeholder="limit", id="orm-limit", value="10"),
                     classes="orm-row"
                 )
-                yield Button("Execute Query", variant="success", id="btn-orm-run")
+                with Horizontal(classes="orm-row"):
+                    yield Button("Execute Query", variant="success", id="btn-orm-run")
+                    yield Button("Prev", id="btn-orm-prev")
+                    yield Button("Next", id="btn-orm-next")
+                    yield Label("Offset: 0", id="lbl-orm-offset")
                 yield DataTable(id="orm-results")
                 yield Log(id="orm-log")
         yield Footer()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn-orm-run":
+        if event.button.id in ["btn-orm-run", "btn-orm-prev", "btn-orm-next"]:
+            if event.button.id == "btn-orm-prev":
+                self.offset = max(0, self.offset - self.limit)
+            elif event.button.id == "btn-orm-next":
+                self.offset += self.limit
+            else:
+                self.offset = 0 # Reset on new run
+                try:
+                    self.limit = int(self.query_one("#orm-limit", Input).value or 10)
+                except:
+                    self.limit = 10
+
+            self.query_one("#lbl-orm-offset", Label).update(f"Offset: {self.offset}")
+
             model_list = self.query_one("#orm-model-list", ListView)
             selected = model_list.highlighted_child
             if not selected:
@@ -284,14 +339,7 @@ class ORMExplorerScreen(Screen):
             order_val = self.query_one("#orm-order", Input).value
             limit_val = self.query_one("#orm-limit", Input).value
 
-            query = f"{model_cls}.objects"
-            if filter_val: query += f".filter({filter_val})"
-            if order_val: query += f".order_by('{order_val}')"
-            if limit_val: query += f"[:{limit_val}]"
-            else: query += "[:10]"
-
             log = self.query_one("#orm-log", Log)
-            log.write(f"> {query}.values()\n")
 
             script = f"""
 import django; django.setup()
@@ -299,11 +347,14 @@ from django.apps import apps
 model = apps.get_model('{app_label}', '{model_cls}')
 qs = model.objects
 if "{filter_val}":
-    f = eval("dict(" + "{filter_val}".replace("=", ":") + ")") # Very basic hack
-    qs = qs.filter(**f)
+    try:
+        f = eval("dict(" + "{filter_val}".replace("=", ":") + ")")
+        qs = qs.filter(**f)
+    except: pass
 if "{order_val}": qs = qs.order_by("{order_val}")
-limit = int("{limit_val}" or 10)
-results = list(qs.values()[:limit])
+limit = int("{self.limit}")
+offset = int("{self.offset}")
+results = list(qs.values()[offset:offset+limit])
 import json; print(json.dumps(results, default=str))
 """
             res = await self.runner.run("shell", "-c", script)
@@ -451,6 +502,35 @@ class AIAssistantScreen(Screen):
                 for s in suggestions:
                     log.write(s + "\n")
 
+class RefactorScreen(Screen):
+    def __init__(self, project: DjangoProject):
+        super().__init__()
+        self.project = project
+        self.manager = SettingsManager(project)
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="refactor-container"):
+            yield Label("Smart Refactor Tools (Experimental)")
+            yield Label("Rename App:")
+            yield Input(placeholder="old_name", id="old-app-name")
+            yield Input(placeholder="new_name", id="new-app-name-ref")
+            yield Button("Rename App", variant="warning", id="btn-rename-app")
+            yield Log(id="refactor-log")
+        yield Footer()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-rename-app":
+            old = self.query_one("#old-app-name", Input).value
+            new = self.query_one("#new-app-name-ref", Input).value
+            log = self.query_one("#refactor-log", Log)
+            if old and new:
+                log.write(f"Renaming {old} to {new}...\n")
+                results = self.manager.rename_app(old, new)
+                for r in results:
+                    log.write(f"- {r}\n")
+                self.notify("Rename operation finished. Check logs.")
+
 class DevOpsScreen(Screen):
     def __init__(self, project: DjangoProject):
         super().__init__()
@@ -561,6 +641,14 @@ class DjangoTUI(App):
         border: solid $accent;
         margin-top: 1;
     }
+    #refactor-container {
+        padding: 1;
+    }
+    #refactor-log {
+        height: 1fr;
+        border: solid $accent;
+        margin-top: 1;
+    }
     #ai-container {
         padding: 1;
     }
@@ -576,6 +664,11 @@ class DjangoTUI(App):
         height: auto;
         align: left middle;
         margin-bottom: 1;
+    }
+    .settings-header {
+        height: auto;
+        padding: 1;
+        border-bottom: solid $primary;
     }
     #settings-container Label {
         width: 20;
@@ -696,6 +789,7 @@ class DjangoTUI(App):
         ("x", "switch_screen('devops')", "DevOps"),
         ("t", "switch_screen('tests')", "Tests"),
         ("a", "switch_screen('ai')", "AI"),
+        ("r", "switch_screen('refactor')", "Refactor"),
     ]
 
     def on_mount(self) -> None:
@@ -709,6 +803,7 @@ class DjangoTUI(App):
         self.install_screen(DevOpsScreen(self.project), name="devops")
         self.install_screen(TestRunnerScreen(self.project), name="tests")
         self.install_screen(AIAssistantScreen(self.project), name="ai")
+        self.install_screen(RefactorScreen(self.project), name="refactor")
         self.push_screen("dashboard")
 
 if __name__ == "__main__":
